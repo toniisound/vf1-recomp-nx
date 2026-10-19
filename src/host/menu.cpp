@@ -60,11 +60,17 @@ struct game_menu::impl
 
 game_menu::game_menu() : m(std::make_unique<impl>()) {}
 
-game_menu::~game_menu()
+game_menu::~game_menu() { shutdown(); }
+
+// RmlUi's textures go back to the renderer: before SDL_Quit (after it, a GL renderer's are gone and
+// freeing them crashed, SDL 2's at least)
+void game_menu::shutdown()
 {
 	if (m->ctx) {
 		Rml::RemoveContext(m->ctx->GetName());
 		Rml::Shutdown();
+		m->ctx = nullptr;
+		m->doc = m->overlay = nullptr;
 	}
 }
 
@@ -310,8 +316,15 @@ bool game_menu::handle_event(const SDL_Event &e)
 		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: move(+1); break;
 		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: change(-1); break;
 		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: change(+1); break;
+#ifdef __SWITCH__
+		// the Switch's SDL maps its buttons by place (SOUTH is the B at the bottom): A, on the
+		// right, chooses and B goes back, as everywhere on the Switch
+		case SDL_GAMEPAD_BUTTON_EAST: activate(); break;
+		case SDL_GAMEPAD_BUTTON_SOUTH: pop(); break;
+#else
 		case SDL_GAMEPAD_BUTTON_SOUTH: activate(); break;
 		case SDL_GAMEPAD_BUTTON_EAST: pop(); break;
+#endif
 		case SDL_GAMEPAD_BUTTON_NORTH: clear(); break;
 		case SDL_GAMEPAD_BUTTON_START: case SDL_GAMEPAD_BUTTON_BACK: case SDL_GAMEPAD_BUTTON_GUIDE: case SDL_GAMEPAD_BUTTON_TOUCHPAD: close(); break;
 		default: break;

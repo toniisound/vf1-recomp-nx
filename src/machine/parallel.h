@@ -1,12 +1,30 @@
 // A small pool of worker threads for splitting a frame's drawing by rows.
 #pragma once
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+// The Nintendo Switch: a homebrew program has cores 0 to 2 (3 is the system's), and a new thread
+// starts on the core of the one that made it, so the drawing threads are put on cores 1 and 2
+// themselves (the game runs on 0). Elsewhere the system spreads them.
+#ifdef __SWITCH__
+extern "C" uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferred_core, uint32_t affinity_mask);
+extern "C" uint32_t svcGetCurrentProcessorNumber(void);
+inline void vf_thread_to_core(int core) { svcSetThreadCoreMask(0xffff8000u /* this thread */, core, 1u << core); }
+// The drawing threads' first core (1; 2 when a thread of its own draws the picture on core 1: the
+// host's render thread) and how many there are (set before the pool is first used)
+inline int g_vf_first_core = 1, g_vf_pool_workers = 2;
+inline int vf_worker_core(int i) { return g_vf_first_core + i % (3 - g_vf_first_core); }
+#else
+inline void vf_thread_to_core(int) {}
+inline int vf_worker_core(int) { return 0; }
+#endif
 
 class row_pool
 {
@@ -73,9 +91,17 @@ private:
 	row_pool()
 	{
 		int n = std::clamp(int(std::thread::hardware_concurrency()) - 2, 0, 7);   // the CPU and sound keep theirs
+#ifdef __SWITCH__
+		n = g_vf_pool_workers;   // cores 1 and 2 (the game keeps 0), or 2 alone (the render thread has 1)
+		fprintf(stderr, "the game's thread on core %u\n", svcGetCurrentProcessorNumber());
+#endif
 		if (const char *t = getenv("VF_THREADS")) n = std::clamp(atoi(t) - 1, 0, 63);   // testing: this many drawing threads in all
 		for (int i = 0; i < n; i++)
-			m_workers.emplace_back([this] {
+			m_workers.emplace_back([this, i] {
+				vf_thread_to_core(vf_worker_core(i));
+#ifdef __SWITCH__
+				fprintf(stderr, "drawing thread %d on core %u (wanted %d)\n", i + 1, svcGetCurrentProcessorNumber(), vf_worker_core(i));
+#endif
 				unsigned seen = 0;
 				for (;;) {
 					std::unique_lock<std::mutex> l(m_mu);

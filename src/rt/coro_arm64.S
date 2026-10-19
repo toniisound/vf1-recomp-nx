@@ -4,6 +4,12 @@
 	.text
 	.p2align 2
 	.globl _coro_switch
+#if !defined(__APPLE__)
+	// ELF (Linux, the Switch): C's names have no leading underscore
+	.globl coro_switch
+	.type coro_switch, %function
+coro_switch:
+#endif
 _coro_switch:
 	sub sp, sp, #160
 	stp x19, x20, [sp, #0]
@@ -34,6 +40,11 @@ _coro_switch:
 	ret
 
 	.globl _coro_start
+#if !defined(__APPLE__)
+	.globl coro_start
+	.type coro_start, %function
+coro_start:
+#endif
 _coro_start:
 	mov x0, x20
 	blr x19

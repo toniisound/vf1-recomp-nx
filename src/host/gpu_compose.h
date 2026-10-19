@@ -5,7 +5,7 @@
 // source pixel whole or leaves it out (KEY's top byte: 0xff) make the target the CPU's picture.
 #pragma once
 #include "../machine/model1.h"
-#include <SDL3/SDL.h>
+#include "sdl3_compat.h"   // SDL 3, or SDL 3 on SDL 2 (VF_SDL2: the Switch)
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>

@@ -1,0 +1,133 @@
+# The Nintendo Switch build: a homebrew .nro (devkitPro's devkitA64, libnx and switch-sdl2).
+#
+# The game's code is recompiled ahead of time from your own vf.zip to C++ (build/gen/vf_rec.cpp, by
+# the desktop Makefile with the PC's own compilers), then everything is built for the Switch:
+#
+#   tools/switch/build.sh roms/vf.zip          does it all, or by hand:
+#   python3 tools/romset.py roms/vf.zip build/vf
+#   make build/gen/vf_rec.cpp build/musashi/m68kops.c
+#   make -f Makefile.switch
+#
+# Needs (dkp-pacman): switch-dev switch-sdl2 switch-freetype switch-zlib (and their dependencies).
+# The source lists are the desktop Makefile's `vf` target's: keep them in step with it.
+
+.SUFFIXES:
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Set DEVKITPRO to devkitPro's folder (export DEVKITPRO=/opt/devkitpro)")
+endif
+# (before switch_rules, which fills in any left empty)
+APP_TITLE   := Virtua Fighter Recomp
+APP_AUTHOR  ?= Toniisound
+APP_VERSION ?= 1.1
+APP_ICON    := switch/icon.jpg
+
+include $(DEVKITPRO)/libnx/switch_rules
+
+OUT   := build/switch/vf1-recomp-nx
+OBJ   := build/switch/obj
+ROMFS := build/switch/romfs
+GEN   := build/gen/vf_rec.cpp
+
+PKGCONF := $(PORTLIBS)/bin/aarch64-none-elf-pkg-config
+SDL_CFLAGS := $(shell $(PKGCONF) --cflags sdl2)
+SDL_LIBS   := $(shell $(PKGCONF) --libs sdl2)
+FT_CFLAGS  := $(shell $(PKGCONF) --cflags freetype2)
+FT_LIBS    := $(shell $(PKGCONF) --libs freetype2)
+
+ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+DEFS     := -D__SWITCH__ -DVF_SDL2
+# The game's machine (the TGP, the rasterizer, the sound board) at -O3; -fno-math-errno lets sqrt
+# and the like be single instructions (the results are the same, only errno isn't set)
+OPT      ?= -O3 -fno-math-errno
+# The recompiled game's code: -O1 as the desktop build has it (a very large file); REC_OPT=-O2 is
+# a little quicker in play but takes much longer and more memory to build
+REC_OPT  ?= -O1
+CFLAGS   := $(OPT) -g -ffunction-sections -fdata-sections $(ARCH) $(DEFS) -I$(LIBNX)/include -I$(PORTLIBS)/include
+CXXFLAGS := $(CFLAGS) -std=gnu++20 -Wall -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-function \
+            -Wno-psabi -Ithird_party/glm -Isrc/core/shim_include
+ASFLAGS  := -g $(ARCH)
+LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT).map
+LIBS     := $(SDL_LIBS) $(FT_LIBS) -lz -lnx -lm
+
+RML_CFLAGS := -DRMLUI_STATIC_LIB -DRMLUI_FONT_ENGINE_FREETYPE -DRMLUI_SDL_VERSION_MAJOR=2 \
+              -Ithird_party/rmlui/Include -Ithird_party/rmlui/Backends
+
+# ---- the sources (the desktop Makefile's) ----
+CORE    := src/core/v60_device.cpp src/core/mb86233.cpp
+SOUND   := src/machine/m1audio.cpp src/machine/multipcm.cpp third_party/ymfm/ymfm_opn.cpp third_party/ymfm/ymfm_adpcm.cpp third_party/ymfm/ymfm_ssg.cpp
+MACHINE := src/machine/model1.cpp src/machine/model1_tgp.cpp src/machine/model1_tgp_lle.cpp src/machine/model1_video.cpp src/machine/model1_sky.cpp \
+           src/machine/model1_interp.cpp src/machine/model1_gpu.cpp src/machine/model1_edge_aa.cpp src/machine/model1io.cpp
+RT      := src/rt/rec_rt.cpp src/rt/coro.cpp
+HOST    := src/host/main.cpp src/host/menu.cpp src/host/romset.cpp src/host/stb_image_impl.cpp src/host/switch_platform.cpp
+RML_SRC := $(wildcard third_party/rmlui/Source/Core/*.cpp third_party/rmlui/Source/Core/*/*.cpp) \
+           third_party/rmlui/Backends/RmlUi_Platform_SDL.cpp third_party/rmlui/Backends/RmlUi_Renderer_SDL.cpp
+MUSASHI := build/musashi/m68kops.c third_party/musashi/m68kcpu.c third_party/musashi/m68kdasm.c third_party/musashi/softfloat/softfloat.c
+Z80     := third_party/z80/z80.c
+ASM     := src/rt/coro_arm64.S
+
+OFILES := $(patsubst %,$(OBJ)/%.o,$(HOST) $(CORE) $(MACHINE) $(SOUND) $(RT) $(RML_SRC) $(MUSASHI) $(Z80) $(ASM) $(GEN))
+
+.PHONY: all clean romfs
+all: $(OUT).nro
+
+# ---- what has to be made on the PC first ----
+$(GEN) build/musashi/m68kops.c:
+	@echo "missing $@: make it with the desktop Makefile first (tools/switch/build.sh does it all):"
+	@echo "  python3 tools/romset.py roms/vf.zip build/vf && make build/gen/vf_rec.cpp build/musashi/m68kops.c"
+	@false
+
+# ---- compiling ----
+$(OBJ)/version.h: FORCE
+	@mkdir -p $(OBJ)
+	@printf '#define VF_VERSION "%s"\n#define VF_DATE "%s"\n' "$(APP_VERSION) (Switch)" "$(shell git log -1 --format=%cd --date=format:'%b %-d %Y' 2>/dev/null)" > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+FORCE:
+
+$(OBJ)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo $<
+	@$(CXX) $(CXXFLAGS) -MMD -c $< -o $@
+
+$(OBJ)/src/host/%.cpp.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS) -I$(OBJ)
+$(OBJ)/src/host/main.cpp.o: $(OBJ)/version.h
+$(OBJ)/third_party/rmlui/%.cpp.o: CXXFLAGS += $(RML_CFLAGS) $(FT_CFLAGS) $(SDL_CFLAGS) -w -O2
+$(OBJ)/src/host/stb_image_impl.cpp.o: CXXFLAGS += -w
+# the recompiled game: large, as the desktop build has it
+$(OBJ)/$(GEN).o: $(GEN)
+	@mkdir -p $(dir $@)
+	@echo $< "(the recompiled game: a few minutes)"
+	@$(CXX) $(CXXFLAGS) $(REC_OPT) -Isrc/rt -c $< -o $@
+
+$(OBJ)/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	@echo $<
+	@$(CC) $(CFLAGS) -w -Ithird_party/musashi -Ibuild/musashi -c $< -o $@
+
+$(OBJ)/%.S.o: %.S
+	@mkdir -p $(dir $@)
+	@echo $<
+	@$(CC) $(ASFLAGS) -x assembler-with-cpp -c $< -o $@
+
+# ---- the RomFS: the menu's files ----
+romfs:
+	@rm -rf $(ROMFS) && mkdir -p $(ROMFS)/assets
+	@cp -R assets/ui assets/fonts $(ROMFS)/assets/
+	@[ -d assets/backgrounds ] && cp -R assets/backgrounds $(ROMFS)/assets/ || true
+
+# ---- linking and the .nro ----
+$(OUT).elf: $(OFILES)
+	@echo linking $(notdir $@)
+	@$(CXX) $(LDFLAGS) $(OFILES) $(LIBS) -o $@
+
+$(OUT).nacp: Makefile.switch
+	@mkdir -p $(dir $@)
+	@nacptool --create "$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $@
+
+$(OUT).nro: $(OUT).elf $(OUT).nacp romfs
+	@elf2nro $< $@ --icon=$(APP_ICON) --nacp=$(OUT).nacp --romfsdir=$(ROMFS)
+	@echo built ... $@
+
+clean:
+	rm -rf build/switch
+
+-include $(OFILES:.o=.d)

@@ -1,7 +1,7 @@
 // The in-game menu, drawn with RmlUi over the paused game (assets/ui/menu.rml and menu.rcss).
 // The host builds the pages; the menu handles the keyboard, pads and mouse.
 #pragma once
-#include <SDL3/SDL.h>
+#include "sdl3_compat.h"   // SDL 3, or SDL 3 on SDL 2 (VF_SDL2: the Switch)
 #include <functional>
 #include <memory>
 #include <string>
@@ -31,6 +31,8 @@ class game_menu
 public:
 	game_menu();
 	~game_menu();
+	void shutdown();                      // (before SDL_Quit)
+	
 	// Loads the fonts and the document from assets_dir; false if they aren't there.
 	bool init(SDL_Window *win, SDL_Renderer *ren, const std::string &assets_dir);
 	bool ready() const;

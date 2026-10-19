@@ -6,11 +6,13 @@
 #if SDL_MAJOR_VERSION >= 3
 	// vf1-recomp: SDL 3.4 loads BMP and PNG itself (SDL_LoadSurface_IO); no SDL_image
 	// #include <SDL3_image/SDL_image.h>
-#else
+#elif !defined(VF_SDL2)
 	#include <SDL_image.h>
 #endif
 
-#if SDL_MAJOR_VERSION == 2 && !(SDL_VIDEO_RENDER_OGL)
+// vf1-recomp (VF_SDL2, the Switch): SDL 2 without SDL_image (the menu loads no images: a BMP at
+// most), on any renderer that blends as asked (the Switch's is OpenGL ES 2)
+#if SDL_MAJOR_VERSION == 2 && !(SDL_VIDEO_RENDER_OGL) && !defined(VF_SDL2)
 	#error "Only the OpenGL SDL backend is supported."
 #endif
 
@@ -149,6 +151,11 @@ Rml::TextureHandle RenderInterface_SDL::LoadTexture(Rml::Vector2i& texture_dimen
 	auto GetSurfaceFormat = [](SDL_Surface* surface) { return surface->format; };
 	auto ConvertSurface = [](SDL_Surface* surface, SDL_PixelFormat format) { return SDL_ConvertSurface(surface, format); };
 	auto DestroySurface = [](SDL_Surface* surface) { SDL_DestroySurface(surface); };
+#elif defined(VF_SDL2)
+	auto CreateSurface = [&]() -> SDL_Surface* { return extension == "bmp" ? SDL_LoadBMP_RW(SDL_RWFromMem(buffer.get(), int(buffer_size)), 1) : nullptr; };
+	auto GetSurfaceFormat = [](SDL_Surface* surface) { return surface->format->format; };
+	auto ConvertSurface = [](SDL_Surface* surface, Uint32 format) { return SDL_ConvertSurfaceFormat(surface, format, 0); };
+	auto DestroySurface = [](SDL_Surface* surface) { SDL_FreeSurface(surface); };
 #else
 	auto CreateSurface = [&]() { return IMG_LoadTyped_RW(SDL_RWFromMem(buffer.get(), int(buffer_size)), 1, extension.c_str()); };
 	auto GetSurfaceFormat = [](SDL_Surface* surface) { return surface->format->format; };

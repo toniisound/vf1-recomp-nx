@@ -3,6 +3,8 @@
 // Ported from MAME's Model 1 driver, BSD-3-Clause, copyright-holders: Olivier Galibert.
 #pragma once
 #include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include "parallel.h"
 #include <cmath>
@@ -42,6 +44,7 @@ public:
 	struct work_trace {
 		int tiles_full = 0, layers = 0, sky_build = 0, sky_scale = 0, sky_scale_sync = 0, padded = 0;
 		uint64_t tiles_ns = 0, layers_ns = 0, sky_build_ns = 0, sky_scale_ns = 0, padded_ns = 0, edge_ns = 0;
+		uint64_t d3_ns = 0, raster_ns = 0, draw2d_ns = 0;   // the 3D (the list's objects and the rasterizer), the rasterizer alone; the 2D layers drawn
 	} m_work;
 	static uint64_t trace_ns();
 
@@ -97,6 +100,16 @@ public:
 	static constexpr const char *UNUSED_CHARACTERS[] = { "Akira", "Siba (Majido)", "Jeff", "Takeru (early Akira)",
 														 "Rekka (Koskol brother)", "Score (Koskol brother)", "Aeon (Koskol brother)", "Dural" };
 	void set_akira_slot(int which);
+	// Pipelined drawing (the Switch): this model1 only draws, from what `src` (the one running the
+	// game) holds now: the display lists kept for smooth motion, the 2D's RAMs, the palette, the
+	// lights, the camera. What only drawing changes (the sky's state, the caches) stays its own.
+	void copy_render_inputs(model1 &src);   // (src: its list of uploads taken)
+	// The one running the game draws nothing of its own (the 2D screens' pictures included): the
+	// one above draws them all.
+	void set_record_only(bool on) { m_record_only = on; }
+	// The 2D layers kept from earlier pictures (cached_layer) drawn again now and compared: the
+	// pixels that differ (0: what was kept is what would be drawn). A check for the log.
+	long long check_kept_layers();
 	void akira_slot_heads(uint32_t record);   // (set_akira_slot: a select portrait for a head without one)
 	// The select's icon for the character in Akira's place, in his icon's tiles (56 x 64 pixels,
 	// xRGB, 15 colours at most; nullptr: his own). Returns false for a picture it can't show.
@@ -441,7 +454,8 @@ private:
 	// each layer at arcade resolution, kept for the game frame it was drawn for: smooth motion draws
 	// several pictures a frame and the tiles only change with the frame. With each row's drawn span,
 	// so the scaling skips what's empty (the HUD and text layers are mostly empty).
-	struct layer_cache { uint64_t frame = ~0ull; int flags = -1, ext = -1; bitmap_rgb32 px; std::vector<int16_t> x0, x1; uint64_t gen = 0; };
+	struct layer_cache { uint64_t frame = ~0ull; int flags = -1, ext = -1; bitmap_rgb32 px; std::vector<int16_t> x0, x1; uint64_t gen = 0, fp = 0; };
+	uint64_t m_pens_fp = 0;                          // the pens, as one number (each game frame's)
 	// the sky layer as last drawn (once a game frame, as the others; its panorama placing every time)
 	uint64_t m_l4_frame = ~0ull; int m_l4_ext = -1; bool m_l4_coords = false; uint64_t m_l4_gen = 0;
 	// The GPU's parts (model1_gpu.cpp)
@@ -937,6 +951,16 @@ private:
 	// What the picture last shown was drawn from, kept as the next frame starts (the shown picture
 	// is then the current one): its lists, 2D, palette and lights. When frames run on without a new
 	// picture shown, redraw() swaps these in to draw that same moment again (model1_interp.cpp).
+	// The list's uploads to the TGP's colour RAM and the polygon RAM since copy_render_inputs last
+	// took them (a drawing twin's: a kept list's are made at its vblank, not when it's drawn again)
+	struct upload_span { int64_t lo = INT64_MAX, hi = 0; };
+	upload_span m_tgp_up, m_poly_up;
+	static void note_upload(upload_span &u, int64_t at, int64_t len, int64_t size)
+	{
+		const int64_t a = std::clamp<int64_t>(at, 0, size), b = std::clamp<int64_t>(at + len, 0, size);
+		if (a < b) { u.lo = std::min(u.lo, a); u.hi = std::max(u.hi, b); }
+	}
+	bool m_record_only = false;
 	struct still_state
 	{
 		uint64_t frame = ~0ull;

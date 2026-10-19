@@ -38,6 +38,29 @@ public:
 	// a copy of them is made only when they changed.
 	uint64_t char_gen = 0;
 	void swap_rams(std::vector<uint16_t> &tiles, std::vector<uint16_t> &chars) { tile_ram.swap(tiles); char_ram.swap(chars); m_dirty = true; }
+	// The RAMs made another's (a model1 that only draws, from the one that runs the game): only what
+	// differs is written, noted as written, so update() decodes just that again. True: something did.
+	bool copy_rams_from(const segas24_tile &s)
+	{
+		bool any = false;
+		for (size_t o = 0; o < tile_ram.size(); o++)
+			if (tile_ram[o] != s.tile_ram[o]) {
+				tile_ram[o] = s.tile_ram[o];
+				if (o < 0x4000) { m_entry_dirty[o] = 1; m_entries_dirty = true; }
+				any = true;
+			}
+		if (char_gen != s.char_gen) {
+			for (size_t c = 0; c < char_ram.size() / 16; c++)
+				if (memcmp(&char_ram[c * 16], &s.char_ram[c * 16], 32)) {
+					memcpy(&char_ram[c * 16], &s.char_ram[c * 16], 32);
+					m_char_dirty[c & 0x3fff] = 1;
+					m_chars_dirty = true;
+				}
+			char_gen = s.char_gen;
+			any = true;
+		}
+		return any;
+	}
 
 	// One map as a 512x512 picture (after update()), for exporting the artwork.
 	void render_map(int l, uint32_t *out) const
@@ -179,6 +202,34 @@ public:
 				}
 			}
 		}
+	}
+
+	// Everything draw(layer) reads from the RAMs, as one number: the layer's registers, its map (and
+	// its pair's, in the split modes), its line scroll table when on, the window mask, the tiles' graphics
+	// (char_gen). The same number: draw() would draw the same pixels (with the same pens and place).
+	uint64_t layer_fingerprint(int layer) const
+	{
+		uint64_t h = 1469598103934665603ull;
+		auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+		auto mix_words = [&](size_t at, size_t n) {
+			const uint16_t *p = &tile_ram[at];
+			for (size_t i = 0; i + 4 <= n; i += 4)
+				mix(uint64_t(p[i]) | uint64_t(p[i + 1]) << 16 | uint64_t(p[i + 2]) << 32 | uint64_t(p[i + 3]) << 48);
+		};
+		const int m = layer >> 1;
+		const uint16_t hscr = tile_ram[0x5000 + m], vscr = tile_ram[0x5004 + m], ctrl = tile_ram[0x5004 + (m & 2)];
+		mix(uint64_t(layer) | uint64_t(hscr) << 8 | uint64_t(vscr) << 24 | uint64_t(ctrl) << 40);
+		if (vscr & 0x8000) return h;                       // (not drawn)
+		const bool split = ctrl & 0x6000;
+		mix(char_gen);
+		mix_words(size_t(m) * 0x1000, 0x1000);
+		if (split) {
+			mix(uint64_t(tile_ram[0x5000 + (m ^ 1)]) | uint64_t(tile_ram[0x5004 + (m ^ 1)]) << 16);
+			mix_words(size_t(m ^ 1) * 0x1000, 0x1000);
+		}
+		if (hscr & 0x8000) mix_words(0x4000 + 0x200 * size_t(m), 0x200);
+		mix_words(layer & 4 ? 0x6800 : 0x6000, 0x800);
+		return h;
 	}
 
 	std::vector<uint16_t> char_ram, tile_ram;

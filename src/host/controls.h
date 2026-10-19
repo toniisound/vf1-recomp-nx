@@ -1,7 +1,7 @@
 // The players' controls: keys and pad buttons for each of VF's moves, and which pad each player
 // holds. Edited in the menu (Controls), kept in settings.ini.
 #pragma once
-#include <SDL3/SDL.h>
+#include "sdl3_compat.h"   // SDL 3, or SDL 3 on SDL 2 (VF_SDL2: the Switch)
 #include <map>
 #include <string>
 
@@ -83,6 +83,25 @@ struct player_controls
 	// For people: the Xbox-style names most pads (and the Deck) print.
 	static std::string pad_label(int code)
 	{
+#ifdef __SWITCH__
+		// the Switch's own names (its SDL maps the buttons by place: SOUTH is the B at the bottom)
+		switch (code) {
+		case PAD_NONE: return "-";
+		case PAD_LT: return "ZL";
+		case PAD_RT: return "ZR";
+		case SDL_GAMEPAD_BUTTON_SOUTH: return "B";
+		case SDL_GAMEPAD_BUTTON_EAST: return "A";
+		case SDL_GAMEPAD_BUTTON_WEST: return "Y";
+		case SDL_GAMEPAD_BUTTON_NORTH: return "X";
+		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "L";
+		case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "R";
+		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "Left stick press";
+		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "Right stick press";
+		case SDL_GAMEPAD_BUTTON_START: return "+";
+		case SDL_GAMEPAD_BUTTON_BACK: return "-";
+		default: break;
+		}
+#endif
 		switch (code) {
 		case PAD_NONE: return "-";
 		case PAD_LT: return "LT";

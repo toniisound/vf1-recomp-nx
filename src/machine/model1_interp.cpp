@@ -129,7 +129,8 @@ void model1::record_frame()
 		m_logic[0] = m_logic[1] = m_logic_prev = logic_frame{};
 		// (when the host puts pictures together on the GPU: drawn in parts, so the 2D screens and
 		// curtains don't cost a whole picture drawn at the render scale and uploaded every frame)
-		if (m_parts_mode) render_parts(double(m_frame), m_own_parts, false);
+		if (m_record_only) {}                        // (another model1 draws: copy_render_inputs)
+		else if (m_parts_mode) render_parts(double(m_frame), m_own_parts, false);
 		else {
 			screen_update(m_bitmap, m_bitmap.cliprect());
 			m_unshown = true;
@@ -260,6 +261,40 @@ void model1::keep_still()
 }
 
 // Exchanges the kept state with the live one (twice: in to draw the kept moment, back out).
+void model1::copy_render_inputs(model1 &s)
+{
+	m_frame = s.m_frame;
+	// the list's uploads (the fighters' colours, polygons in RAM): only the span written since
+	auto take = [](upload_span &u, auto *dst, const auto *src) {
+		if (u.lo < u.hi) std::copy(src + u.lo, src + u.hi, dst + u.lo);
+		u = upload_span{};
+	};
+	take(s.m_tgp_up, m_tgp_ram.get(), s.m_tgp_ram.get());
+	take(s.m_poly_up, m_poly_ram.get(), s.m_poly_ram.get());
+	auto same = [](const logic_frame &a, const logic_frame &b) { return a.frame == b.frame && a.hash == b.hash && a.list.size() == b.list.size(); };
+	if (!same(m_logic[0], s.m_logic[0])) m_logic[0] = s.m_logic[0];
+	if (!same(m_logic[1], s.m_logic[1])) m_logic[1] = s.m_logic[1];
+	if (!same(m_logic_prev, s.m_logic_prev)) m_logic_prev = s.m_logic_prev;
+	std::copy(std::begin(s.m_sky_hist), std::end(s.m_sky_hist), m_sky_hist);
+	if (m_tiles.copy_rams_from(s.m_tiles)) m_tiles_updated = ~0ull;
+	std::copy(std::begin(s.m_pens), std::end(s.m_pens), m_pens);
+	m_paletteram16_ram = s.m_paletteram16_ram;
+	m_color_xlat_ram = s.m_color_xlat_ram;
+	m_paletteram16 = m_paletteram16_ram.data();
+	m_color_xlat = m_color_xlat_ram.data();
+	std::copy(std::begin(s.m_view->lightparams), std::end(s.m_view->lightparams), m_view->lightparams);
+	m_view->light = s.m_view->light;
+	m_view->spec_enable = s.m_view->spec_enable;
+	std::copy(&s.m_ram_b[0x17f0], &s.m_ram_b[0x17f4], &m_ram_b[0x17f0]);   // (the camera pointer)
+	m_listctl[0] = s.m_listctl[0]; m_listctl[1] = s.m_listctl[1];
+	m_list_written[0] = s.m_list_written[0]; m_list_written[1] = s.m_list_written[1];
+	m_display_list0_ram = s.m_display_list0_ram;
+	m_display_list1_ram = s.m_display_list1_ram;
+	m_display_list0 = m_display_list0_ram.data();
+	m_display_list1 = m_display_list1_ram.data();
+	m_last_quads = s.m_last_quads;
+}
+
 void model1::swap_still()
 {
 	still_state &s = m_still;

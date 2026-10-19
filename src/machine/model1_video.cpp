@@ -716,6 +716,7 @@ void model1::draw_quads(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 		const uint64_t t0 = trace_ns();
 		raster_quads(bitmap, view, count);
 		m_raster_ms += (trace_ns() - t0) / 1e6;
+		m_work.raster_ns += trace_ns() - t0;
 	}
 
 	view->x1 = save_x1;
@@ -1828,6 +1829,7 @@ void model1::tgp_render(bitmap_rgb32 &bitmap, const rectangle &cliprect, render_
 				{
 					m_tgp_ram[adr - 0x40000 + i] = readi16(list_offset + 6 + 2 * i);
 				}
+				if (!m_replaying) note_upload(m_tgp_up, adr - 0x40000, len, 0x100000 - 0x40000);
 				list_offset += 6 + len * 2;
 				break;
 			}
@@ -1839,6 +1841,7 @@ void model1::tgp_render(bitmap_rgb32 &bitmap, const rectangle &cliprect, render_
 				{
 					m_poly_ram[adr - 0x800000 + i] = readi(list_offset + 2 * i + 6);
 				}
+				if (!m_replaying) note_upload(m_poly_up, adr - 0x800000, len, 0x400000);
 				list_offset += 6 + len * 2;
 				break;
 			}
@@ -1965,6 +1968,7 @@ void model1::tgp_scan()
 					{
 						m_tgp_ram[adr - 0x40000 + i] = readi16(list_offset + 6 + 2 * i);
 					}
+					note_upload(m_tgp_up, adr - 0x40000, len, 0x100000 - 0x40000);
 					list_offset += 6 + len * 2;
 					break;
 				}
@@ -1976,6 +1980,7 @@ void model1::tgp_scan()
 					{
 						m_poly_ram[adr - 0x800000 + i] = readi(list_offset + 2 * i + 6);
 					}
+					note_upload(m_poly_up, adr - 0x800000, len, 0x400000);
 					list_offset += 6 + len * 2;
 					break;
 				}
@@ -2332,7 +2337,7 @@ bool model1::bench3d(int reps, double &cpu_ms, double &gpu_ms, long long *differ
 			p.s.x = int(xs[k]); p.s.y = int(ys[k]);
 			pts.push_back(p);
 		}
-		qs.push_back(quad_t(int(col), 0, nullptr, nullptr, nullptr, nullptr));
+		qs.emplace_back(int(col), 0, nullptr, nullptr, nullptr, nullptr);   // (not named: the Switch's newlib has a quad_t of its own)
 		qs.back().obj = obj;
 	};
 	// the backdrop's and the floor's, far to near (a stage's model)

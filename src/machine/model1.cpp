@@ -1148,6 +1148,19 @@ model1::layer_cache &model1::cached_layer(int layer, int flags)
 	layer_cache &c = m_layer_cache[layer & 7];
 	const int tw = SCREEN_W + 2 * m_ext;
 	if (c.frame != m_frame || c.flags != flags || c.ext != m_ext || c.px.width() != tw) {
+#ifdef __SWITCH__
+		static const bool keep = !getenv("VF_NO_LAYER_KEEP");
+#else
+		static const bool keep = getenv("VF_LAYER_KEEP") != nullptr;   // (the Switch's: tests here)
+#endif
+		// (the Switch) a layer whose RAMs and pens are as when it was last drawn: drawn the same
+		// again, so kept as it is (its gen too: what's made from it, and its upload, stay)
+		const uint64_t fp = keep ? m_tiles.layer_fingerprint(layer & 7) ^ (m_pens_fp * 31) ^ uint64_t(flags) << 1 : 0;
+		if (keep && c.px.width() == tw && c.flags == flags && c.ext == m_ext && c.fp == fp && c.frame != ~0ull) {
+			c.frame = m_frame;
+			return c;
+		}
+		c.fp = fp;
 		if (c.px.width() != tw) c.px.allocate(tw, SCREEN_H);
 		c.px.fill(KEY);
 		if (!m_layers_together) m_tiles.m_ox = m_ext;     // (else set for them all)
@@ -1166,6 +1179,25 @@ model1::layer_cache &model1::cached_layer(int layer, int flags)
 		c.frame = m_frame; c.flags = flags; c.ext = m_ext; c.gen++;
 	}
 	return c;
+}
+
+long long model1::check_kept_layers()
+{
+	long long n = 0;
+	const int tw = SCREEN_W + 2 * m_ext;
+	for (int l = 0; l < 8; l++) {
+		const layer_cache &c = m_layer_cache[l];
+		if (c.frame != m_frame || c.px.width() != tw) continue;
+		bitmap_rgb32 fresh;
+		fresh.allocate(tw, SCREEN_H);
+		fresh.fill(0xff000000);
+		m_tiles.m_ox = m_ext;
+		m_tiles.draw(fresh, fresh.cliprect(), l, 0, c.flags);
+		m_tiles.m_ox = 0;
+		for (int y = 0; y < SCREEN_H; y++)
+			for (int x = 0; x < tw; x++) n += fresh.pix(y, x) != c.px.pix(y, x);
+	}
+	return n;
 }
 
 // This frame's layers but the sky, each on a thread of its own (they don't depend on one another).
@@ -1315,6 +1347,11 @@ void model1::screen_update(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 		m_work.tiles_full += m_tiles.all_to_decode();
 		m_tiles.update(m_pens);
 		m_tiles_updated = m_frame;
+		{   // (the layers kept from one picture to the next: see cached_layer)
+			uint64_t h = 1469598103934665603ull;
+			for (size_t i = 0; i < std::size(m_pens); i += 2) h = (h ^ (uint64_t(m_pens[i]) | uint64_t(m_pens[i + 1]) << 32)) * 1099511628211ull;
+			m_pens_fp = h;
+		}
 		m_work.tiles_ns += trace_ns() - t0;
 	}
 	{
@@ -1358,6 +1395,7 @@ void model1::screen_update(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 		last = h;
 	}
 	m_screen_now = m_wide_frame ? nullptr : known;
+	const uint64_t t2d = trace_ns();
 	draw_tiles(bitmap, cliprect, 6, segas24_tile::DRAW_OPAQUE);
 	draw_tiles(bitmap, cliprect, 4, segas24_tile::DRAW_OPAQUE);
 	if (m_screen_now && m_parts) {
@@ -1388,6 +1426,7 @@ void model1::screen_update(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 		draw_tiles(bitmap, cliprect, 0, 0);
 	}
 
+	m_work.draw2d_ns += trace_ns() - t2d;
 	static const bool no_polys = getenv("VF_NO_POLYS") != nullptr;   // debug: the 2D layers alone
 	m_above_hud_seen = false;
 	m_frame_quads = 0;
@@ -1414,7 +1453,7 @@ void model1::screen_update(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 	}
 	m_raster_ms = 0;
 	if (g3) gpu3d_begin(bitmap);
-	if (!no_polys) tgp_render(bitmap, cliprect, RENDER_BELOW_HUD);
+	if (!no_polys) { const uint64_t t0 = trace_ns(); tgp_render(bitmap, cliprect, RENDER_BELOW_HUD); m_work.d3_ns += trace_ns() - t0; }
 	if (g3) gpu3d_end(bitmap);
 	else { m_g3.gpu = false; m_g3.ms = m_raster_ms; m_g3.gpu_ms = 0; }
 	clear_moire_marks(bitmap, cliprect);

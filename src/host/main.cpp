@@ -15,7 +15,10 @@
 #ifdef VF_NATIVE
 #include "../rt/native.h"
 #endif
-#include <SDL3/SDL.h>
+#include "sdl3_compat.h"   // SDL 3, or SDL 3 on SDL 2 (VF_SDL2: the Switch)
+#ifdef __SWITCH__
+#include "switch_platform.h"
+#endif
 #ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
@@ -36,16 +39,73 @@
 #include <vector>
 #include <set>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 // Every message box goes through here: a test run (VF_HIDDEN) never shows one (nor a file picker),
 // the message goes to stderr (log.txt without a console) instead.
 static bool message_box(SDL_MessageBoxFlags flags, const char *title, const std::string &msg)
 {
 	if (getenv("VF_HIDDEN")) { fprintf(stderr, "(hidden: no dialog) %s\n", msg.c_str()); return false; }
+#ifdef __SWITCH__
+	(void)flags;
+	fprintf(stderr, "%s: %s\n", title, msg.c_str());
+	return switch_message(title, msg);
+#else
 	return SDL_ShowSimpleMessageBox(flags, title, msg.c_str(), nullptr);
+#endif
 }
 
 namespace {
+
+// Pipelined drawing (the Switch): a thread of its own, on core 1, draws the picture from a second
+// model1 (copy_render_inputs) while the game runs its next frames on core 0. One job at a time.
+class render_thread
+{
+public:
+	~render_thread() { stop(); }
+	void start(std::function<void()> job)
+	{
+		if (!m_th.joinable()) m_th = std::thread([this] { loop(); });
+		{ std::lock_guard<std::mutex> l(m_mu); m_job = std::move(job); m_busy = true; }
+		m_cv.notify_all();
+	}
+	void wait() { std::unique_lock<std::mutex> l(m_mu); m_cv.wait(l, [&] { return !m_busy; }); }
+	bool busy() { std::lock_guard<std::mutex> l(m_mu); return m_busy; }
+	void stop()
+	{
+		if (!m_th.joinable()) return;
+		wait();
+		{ std::lock_guard<std::mutex> l(m_mu); m_quit = true; }
+		m_cv.notify_all();
+		m_th.join();
+	}
+private:
+	std::thread m_th;
+	std::mutex m_mu;
+	std::condition_variable m_cv;
+	std::function<void()> m_job;
+	bool m_busy = false, m_quit = false;
+	void loop()
+	{
+		vf_thread_to_core(1);
+		for (;;) {
+			std::function<void()> job;
+			{
+				std::unique_lock<std::mutex> l(m_mu);
+				m_cv.wait(l, [&] { return m_quit || (m_busy && m_job); });
+				if (m_quit) return;
+				job = std::move(m_job);
+				m_job = nullptr;
+			}
+			job();
+			{ std::lock_guard<std::mutex> l(m_mu); m_busy = false; }
+			m_cv.notify_all();
+		}
+	}
+};
 
 constexpr double FRAME_HZ = 16000000.0 / (656.0 * 424.0);
 
@@ -358,6 +418,10 @@ struct settings
 	int arcade_coin = -1;   // Arcade mode's coin/credit setting, kept while PC mode makes it free play (-1: not seen yet)
 	std::string roms_folder;   // where the player keeps vf.zip (roms_folder = ...; read before the game starts, kept as written)
 	bool fullscreen = false, timings = false, arcade = false, smooth_bg = false, show_fps = false;
+	bool cpu_boost = true;   // the Switch: the CPU at 1785 MHz while playing (cpu_boost = ...)
+	bool cpu_2d = false;     // the Switch: the picture put together by the CPU, not the GPU (picture_2d = cpu)
+	bool render_thread = true;   // the Switch: the picture drawn on core 1 while the game runs on 0 (render_thread = ...)
+	bool trace = false;      // the Switch: trace.txt, each pass's times (trace = 1; VF_TRACE elsewhere)
 	player_controls ctl[2] = { player_controls::defaults(0), player_controls::defaults(1) };
 
 	void load(const std::string &path)
@@ -390,6 +454,10 @@ struct settings
 		flag("show_fps", show_fps);
 		num("arcade_coins", arcade_coin, -1, 0xffff);
 		num("renderer_3d", renderer3d, 0, 2);
+		flag("cpu_boost", cpu_boost);
+		if (auto it = kv.find("picture_2d"); it != kv.end()) cpu_2d = it->second == "cpu";
+		flag("trace", trace);
+		flag("render_thread", render_thread);
 		num("akira_slot", akira_slot, 0, int(std::size(model1::UNUSED_CHARACTERS)) - 1);
 		num("infinite_energy", infinite_energy, 0, 3);
 		flag("one_hit_ko", one_hit_ko);
@@ -420,6 +488,11 @@ struct settings
 				int(fullscreen), int(timings), volume, int(arcade), int(smooth_bg), music, effects, aa, int(show_fps), filter, ring);
 		if (arcade_coin >= 0) fprintf(f, "arcade_coins = %d\n", arcade_coin);
 		fprintf(f, "renderer_3d = %d\n", renderer3d);
+#ifdef __SWITCH__
+		fprintf(f, "cpu_boost = %d\npicture_2d = %s\n", int(cpu_boost), cpu_2d ? "cpu" : "gpu");
+		if (trace) fprintf(f, "trace = 1\n");
+		fprintf(f, "render_thread = %d\n", int(render_thread));
+#endif
 		if (akira_slot) fprintf(f, "akira_slot = %d\n", akira_slot);
 		if (infinite_energy) fprintf(f, "infinite_energy = %d\n", infinite_energy);
 		if (one_hit_ko) fprintf(f, "one_hit_ko = 1\n");
@@ -519,6 +592,15 @@ bool first_launch(const std::string &data, const std::string &keep, const std::s
 		}
 	}
 	if (getenv("VF_HIDDEN")) { fprintf(stderr, "%sno game found in %s (hidden: no picker)\n", problem.c_str(), roms.string().c_str()); return false; }   // testing
+#ifdef __SWITCH__
+	{
+		std::error_code ec;
+		fs::create_directories(roms, ec);
+		message_box(SDL_MESSAGEBOX_INFORMATION, "Virtua Fighter", problem + "Copy your copy of Virtua Fighter, MAME's \"vf\" set (vf.zip), to this folder on the SD card:\n\n  "
+					+ roms.string() + "/vf.zip\n\n(model1io.zip beside it too, if you have it.) Then start the game again.");
+		return false;
+	}
+#endif
 	SDL_Init(SDL_INIT_VIDEO);
 	const std::string where = "It's copied into " + roms.string() + ", so you only do this once.";
 	std::string note = problem + "Choose your copy of Virtua Fighter: MAME's \"vf\" set (vf.zip).\n\n" + where;
@@ -626,6 +708,10 @@ const char *portable_marker(const std::string &folder)
 // The menu's files: next to the program in a package, else the source tree's assets/.
 std::string find_assets()
 {
+#ifdef __SWITCH__
+	if (FILE *f = fopen(VF_SWITCH_DIR "/assets/ui/menu.rml", "rb")) { fclose(f); return VF_SWITCH_DIR "/assets"; }   // (the player's own, if any)
+	return "romfs:/assets";
+#endif
 	const char *base = SDL_GetBasePath();
 	std::string b = base ? base : "";
 	for (std::string d : { b + "assets", b + "../../assets", std::string("assets") })
@@ -637,6 +723,9 @@ std::string find_assets()
 
 int main(int argc, char **argv)
 {
+#ifdef __SWITCH__
+	switch_platform_init();
+#endif
 	// test runs (VF_HIDDEN): a background process on macOS, so no Dock icon appears for each one
 	if (getenv("VF_HIDDEN")) SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
 	std::string dir = "build/vf";
@@ -742,11 +831,18 @@ int main(int argc, char **argv)
 	// Deck: fullscreen, 16:10.
 	cfg.scale = 2;
 	if (getenv("SteamDeck")) { cfg.fullscreen = true; cfg.aspect = 2; }
+#ifdef __SWITCH__
+	cfg.scale = 1;            // the arcade's own resolution: the Switch's CPU draws the 3D
+	cfg.fullscreen = true;    // (the screen is the window)
+#endif
 	cfg.load(settings_path);
 	if (arg_scale) cfg.scale = std::clamp(arg_scale, 1, 6);
 	if (arg_aspect >= 0) cfg.aspect = arg_aspect;
 	if (arg_full >= 0) cfg.fullscreen = arg_full;
 	if (arg_arcade) cfg.arcade = true;
+#ifdef __SWITCH__
+	switch_cpu_boost(cfg.cpu_boost);
+#endif
 	g_pc_mode = !cfg.arcade;
 	// the 3D's renderer: VF_3D=cpu|gpu|auto (tests) over the setting
 	if (const char *r = getenv("VF_3D")) cfg.renderer3d = !strcmp(r, "cpu") ? 0 : !strcmp(r, "gpu") ? 1 : 2;
@@ -756,16 +852,40 @@ int main(int argc, char **argv)
 	int aspect_i = cfg.aspect;
 	const bool fullscreen = cfg.fullscreen;
 	const int scale = cfg.scale;
+	// Pipelined drawing (the Switch, render_thread = 1): a second model1 draws (no sound, no I/O
+	// board), from the first's state copied between passes; the drawing threads then on core 2 only.
+	std::unique_ptr<model1> twin;
+	model1::regions twin_regions;
+	bool want_twin = getenv("VF_RENDER_THREAD") != nullptr;   // (testing elsewhere)
+#ifdef __SWITCH__
+	// (about 150 MB more: only with the whole of the console's memory, as a game, not the Album)
+	if (cfg.render_thread && !switch_full_memory()) fprintf(stderr, "the picture drawn on the game's core: started from the Album (start a game holding R for the render thread)\n");
+	else if (cfg.render_thread) want_twin = true;
+	if (want_twin) { g_vf_first_core = 2; g_vf_pool_workers = 1; }
+#endif
+	if (want_twin) {
+		twin_regions = game;
+		twin_regions.sndcpu.clear(); twin_regions.pcm1.clear(); twin_regions.pcm2.clear(); twin_regions.ioboard.clear();
+	}
 	model1 m(std::move(game));
 	m.enable_sound();
+	if (want_twin) {
+		twin = std::make_unique<model1>(std::move(twin_regions));
+		m.set_record_only(true);
+		fprintf(stderr, "the picture drawn on core 1 (and 2) while the game runs on core 0\n");
+	}
+	model1 &R = twin ? *twin : m;            // the model1 that draws
+	auto each = [&](const std::function<void(model1 &)> &f) { f(m); if (twin) f(*twin); };
 	// antialiasing draws larger and averages down: within 8x the arcade's size in all (at 32:9 that is
 	// already 10,576 x 3,072 and about 600 MB of buffers; more would fail on ordinary machines)
 	auto aa_fit = [](int scale, int aa) { return std::max(1, std::min(aa, 8 / scale)); };
-	m.set_render_scale(scale * aa_fit(scale, cfg.aa));   // antialiasing: drawn larger, averaged down
-	m.set_edge_aa(cfg.aa == 0);                           // or Low: the edges smoothed
-	m.set_smooth(true);   // always: a picture for each refresh of the screen, between the arcade's 57.5 frames a second
-	m.set_sky_filter(cfg.smooth_bg);
-	m.set_aspect(ASPECTS[aspect_i] > 0 ? ASPECTS[aspect_i] : 16.0f / 9.0f);
+	each([&](model1 &x) {
+		x.set_render_scale(scale * aa_fit(scale, cfg.aa));   // antialiasing: drawn larger, averaged down
+		x.set_edge_aa(cfg.aa == 0);                           // or Low: the edges smoothed
+		x.set_smooth(true);   // always: a picture for each refresh of the screen, between the arcade's 57.5 frames a second
+		x.set_sky_filter(cfg.smooth_bg);
+		x.set_aspect(ASPECTS[aspect_i] > 0 ? ASPECTS[aspect_i] : 16.0f / 9.0f);
+	});
 	// the real I/O board's 93C46 and the stand-in's image are laid out differently
 	const std::string nv_path = dir + "/nvram.sav",
 		ee_path = dir + (m.real_ioboard() ? "/eeprom_93c46.sav" : "/eeprom.sav");
@@ -815,6 +935,7 @@ int main(int argc, char **argv)
 	// Reset; the PC build then runs through the boot screen (about 3.5 s of settings text) unseen.
 	auto boot = [&] {
 		m.reset();
+		if (twin) twin->reset();
 		if (!interp) rec::attach(m.cpu());   // a fresh game stack
 		std::fill_n(&m.work_ram()[0x17f0], 4, 0);   // work RAM survives a reset: forget the last camera (past_boot)
 		if (!g_pc_mode) { sync.start(); return; }
@@ -824,9 +945,11 @@ int main(int argc, char **argv)
 		m.m_audio_out.clear();
 		sync.start();
 	};
-	load_backgrounds(m, find_assets() + "/backgrounds");   // the title and select's widescreen sides
-	load_backgrounds(m, dir + "/backgrounds");   // the player's own (hi-res stage skies...), which win
-	m.set_ring_width(cfg.ring_now());
+	each([&](model1 &x) {
+		load_backgrounds(x, find_assets() + "/backgrounds");   // the title and select's widescreen sides
+		load_backgrounds(x, dir + "/backgrounds");   // the player's own (hi-res stage skies...), which win
+	});
+	each([&](model1 &x) { x.set_ring_width(cfg.ring_now()); });
 	m.set_akira_slot(cfg.akira_slot);
 	auto icon_dirs = [&] { return std::vector<std::string>{ dir + "/icons", find_assets() + "/icons" }; };   // (the player's first)
 	load_secret_icon(m, cfg.akira_slot, icon_dirs());
@@ -872,6 +995,9 @@ int main(int argc, char **argv)
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) fprintf(stderr, "no sound: %s\n", SDL_GetError());
 	// the first window: 1366 x 768, or 16:9 within 90% of a smaller screen's usable area
 	int win_w = 1366, win_h = 768;
+#ifdef __SWITCH__
+	win_w = 1280; win_h = 720;   // the Switch's screen (docked, the console scales it to the TV)
+#endif
 	// testing: VF_WINDOW=WxH, the window's size in points (a hidden one as large as a player's screen)
 	const bool fixed_window = getenv("VF_WINDOW") && sscanf(getenv("VF_WINDOW"), "%dx%d", &win_w, &win_h) == 2;
 	{
@@ -913,17 +1039,17 @@ int main(int argc, char **argv)
 	if (!ren) return fail("Couldn't start the graphics");
 	SDL_SetRenderVSync(ren, 1);          // one picture per refresh of the screen (smooth motion fills them)
 	SDL_Texture *tex = nullptr;
-	auto aa_now = [&] { return m.render_scale() / std::max(1, cfg.scale); };   // the antialiasing in use
+	auto aa_now = [&] { return R.render_scale() / std::max(1, cfg.scale); };   // the antialiasing in use
 	// Antialiasing: the picture is drawn cfg.aa times larger each way and each aa x aa block
 	// averaged into one pixel of what is shown.
-	auto shown_w = [&] { return m.frame_w() / aa_now(); };
-	auto shown_h = [&] { return m.frame_h() / aa_now(); };
+	auto shown_w = [&] { return R.frame_w() / aa_now(); };
+	auto shown_h = [&] { return R.frame_h() / aa_now(); };
 	std::vector<uint32_t> aa_buf;
 	// the antialiased picture into dst (stride in pixels): a buffer, or the texture's own memory
 	auto aa_into = [&](uint32_t *dst, size_t stride) {
 		const int k = aa_now();
-		const int w = shown_w(), h = shown_h(), sw = m.frame_w();
-		const uint32_t *src = m.frame().data();
+		const int w = shown_w(), h = shown_h(), sw = R.frame_w();
+		const uint32_t *src = R.frame().data();
 		// red and blue added together in one word (0x00ff00ff lanes), green in another: 9 pixels
 		// fit (9 x 255 < 4096), and the average is a multiply and a shift, not a divide
 		parallel_rows(h, [&](int y0, int y1) {
@@ -966,7 +1092,7 @@ int main(int argc, char **argv)
 		});
 	};
 	auto shown_frame = [&]() -> const uint32_t * {
-		if (aa_now() == 1) return m.frame().data();
+		if (aa_now() == 1) return R.frame().data();
 		aa_buf.resize(size_t(shown_w()) * shown_h());
 		aa_into(aa_buf.data(), shown_w());
 		return aa_buf.data();
@@ -1002,6 +1128,10 @@ int main(int argc, char **argv)
 	{
 		const char *rname = SDL_GetRendererName(ren);
 		std::string why;
+#ifdef __SWITCH__
+		if (cfg.cpu_2d) why = "the setting (picture_2d = cpu)";
+		else
+#endif
 		if (getenv("VF_CPU_2D")) why = "VF_CPU_2D";
 		else if (!gc.init(ren)) why = "this renderer can't";
 		else if (gc.self_check(why)) gpu_2d = true;
@@ -1153,7 +1283,7 @@ int main(int argc, char **argv)
 			double c = 0, g = 0;
 			long long d = -1;
 			m.m_gpu3d_chosen = cfg.renderer3d == 1;
-			const long long px = (long long)m.frame_w() * m.frame_h();
+			const long long px = (long long)R.frame_w() * R.frame_h();
 			const auto &dd = m.m_bench_diff;
 			if (!m.bench3d(1, c, g, &d) || d < 0 || !m.gpu_diff_ok(dd, px)) {
 				if (d > 0) fprintf(stderr, "the 3D on the GPU (%s): its test picture isn't the CPU's (%lld of %lld pixels differ, %lld drawn on one only, %lld by more than %d)\n",
@@ -1205,7 +1335,7 @@ int main(int argc, char **argv)
 	// after each picture: its time; Auto's checks
 	auto auto_tick = [&] {
 		if (!g3) return;
-		const model1::gpu3d_stats &st = m.m_g3;
+		const model1::gpu3d_stats &st = R.m_g3;
 		if (st.failed != a3.failed) {
 			a3.failed = st.failed;
 			if (!a3.broken) fprintf(stderr, "3D renderer: the GPU failed: the CPU for this run\n");
@@ -1226,10 +1356,10 @@ int main(int argc, char **argv)
 				if (n[1]) fprintf(stderr, " [GPU: recording %.2f ms, on the GPU %.2f ms]", rsum / n[1], gsum / n[1]);
 				{
 					static uint64_t handed0 = 0;
-					if (m.m_g3.handed > handed0) fprintf(stderr, ", %llu straight into the renderer's texture (not waited for)", (unsigned long long)(m.m_g3.handed - handed0));
-					handed0 = m.m_g3.handed;
+					if (R.m_g3.handed > handed0) fprintf(stderr, ", %llu straight into the renderer's texture (not waited for)", (unsigned long long)(R.m_g3.handed - handed0));
+					handed0 = R.m_g3.handed;
 				}
-				if (m.m_g3.checked) fprintf(stderr, ", checked %llu, %llu differ", (unsigned long long)m.m_g3.checked, (unsigned long long)m.m_g3.differ);
+				if (R.m_g3.checked) fprintf(stderr, ", checked %llu, %llu differ", (unsigned long long)R.m_g3.checked, (unsigned long long)R.m_g3.differ);
 				fprintf(stderr, "\n");
 				since = SDL_GetTicksNS(); sum[0] = sum[1] = gsum = rsum = 0; n[0] = n[1] = 0;
 			}
@@ -1265,6 +1395,13 @@ int main(int argc, char **argv)
 	std::set<int> gpu_failed;           // render scales the GPU couldn't put together (a part too large for it)
 	int gpu_verified = 0;               // the game's own pictures checked so far (the 1st, 60th and 600th)
 	model1::gpu_parts parts;
+	// Pipelined drawing: the job drawing the next picture on the twin, and anything else that uses
+	// the twin waits for it first (settle: that picture is then dropped, the twin's state as it was)
+	render_thread drawer;
+	bool job_pending = false;
+	int job_r = -1;
+	uint64_t job_ns = 0;
+	auto settle = [&] { if (twin && job_pending) { drawer.wait(); job_pending = false; } };
 	// The 3D's textures on the renderer's device (gpu3d::draw_target's), wrapped as the renderer's
 	// own, made before a picture that needs them: the picture's size, again when it changes. Any
 	// failure: the 3D comes back to the CPU as before, from then on.
@@ -1278,7 +1415,7 @@ int main(int argc, char **argv)
 	};
 	auto g3_prepare = [&] {
 		if (!g3 || !m.gpu3d_target()) return;
-		const int w = m.frame_w(), h = m.frame_h();
+		const int w = R.frame_w(), h = R.frame_h();
 		if (g3_tex[0] && g3_tw == w && g3_th == h && g3_wrapped == g3->targets_made()) return;
 		g3_unwrap();
 		bool ok = g3->make_targets(w, h, model1::G3_TARGETS);
@@ -1306,14 +1443,15 @@ int main(int argc, char **argv)
 	const int gpu_check = getenv("VF_GPU_CHECK") ? atoi(getenv("VF_GPU_CHECK")) : 0;   // testing: every nth checked
 	int gpu_pictures = 0, gpu_checked = 0, gpu_differ = 0;
 	// the picture on screen, for a file: put together by the GPU, it's drawn whole again first
-	auto saved_frame = [&] { if (m.frame_unshown()) m.redraw(); return shown_frame(); };
+	auto saved_frame = [&] { settle(); if (R.frame_unshown()) R.redraw(); return shown_frame(); };
 	bool curtain = false;                // this pass: the frame to show is a curtain shown during a held scene change
 	auto upload = [&] {
+		settle();
 		show_target = false;
 		// frame() put together in parts holds only the 3D, or a held scene's unshown picture: the
 		// picture on show, drawn whole, is what goes up (but a curtain shown during a hold is
 		// frame() as it is: redrawn, it was the scene before the hold, at the cost of a whole picture)
-		if (m.frame_unshown() && !curtain) m.redraw();
+		if (R.frame_unshown() && !curtain) R.redraw();
 		void *px; int pitch;
 		if (aa_now() > 1 && SDL_LockTexture(tex, nullptr, &px, &pitch)) {
 			aa_into(static_cast<uint32_t *>(px), size_t(pitch) / 4);
@@ -1333,13 +1471,13 @@ int main(int argc, char **argv)
 		while (!tex && cfg.scale > 1) {
 			fprintf(stderr, "a %dx%d picture is too large here (%s): trying %dx\n", shown_w(), shown_h(), SDL_GetError(), cfg.scale - 1);
 			cfg.scale--;
-			m.set_render_scale(cfg.scale * aa_fit(cfg.scale, cfg.aa));
+			each([&](model1 &x) { x.set_render_scale(cfg.scale * aa_fit(cfg.scale, cfg.aa)); });
 			tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, shown_w(), shown_h());
 		}
 		SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
 		std::vector<uint32_t> black(size_t(shown_w()) * shown_h(), 0);
 		SDL_UpdateTexture(tex, nullptr, black.data(), shown_w() * 4);
-		SDL_SetTextureScaleMode(tex, m.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+		SDL_SetTextureScaleMode(tex, R.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
 	};
 	make_texture();
 	// the picture's shape: the chosen one, or the window's (between 4:3 and 32:9)
@@ -1351,7 +1489,7 @@ int main(int argc, char **argv)
 			a = h > 0 ? std::clamp(float(w) / float(h), 4.0f / 3.0f, 32.0f / 9.0f) : 16.0f / 9.0f;
 		}
 		if (std::fabs(a - m.aspect()) > 0.001f)
-			m.set_aspect(a);
+			each([&](model1 &x) { x.set_aspect(a); });
 	};
 	// 496x384 fills a 4:3 tube on the cabinet; widescreen widens the same picture
 	auto present_shape = [&] {
@@ -1505,8 +1643,8 @@ int main(int argc, char **argv)
 		if (const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win))) hz = dm->refresh_rate;
 		const char *rn = SDL_GetRendererName(ren);
 		fprintf(stderr, "render state (%s): %dx (drawn at %dx), antialiasing %s, %s, the 3D: %s, the 2D on the %s (%s), smooth pictures %s, governor %s, vsync %d, screen %.2f Hz, window %d x %d\n",
-				why, cfg.scale, m.render_scale(), cfg.aa == 0 ? "Low" : aa_now() > 1 ? (aa_now() == 2 ? "2x" : "3x") : "off",
-				aspect_i ? ASPECT_NAMES[aspect_i] : "fit", renderer_name().c_str(), gpu_2d && aa_now() == 1 && !gpu_failed.count(m.render_scale()) ? "GPU" : "CPU",
+				why, cfg.scale, R.render_scale(), cfg.aa == 0 ? "Low" : aa_now() > 1 ? (aa_now() == 2 ? "2x" : "3x") : "off",
+				aspect_i ? ASPECT_NAMES[aspect_i] : "fit", renderer_name().c_str(), gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale()) ? "GPU" : "CPU",
 				rn ? rn : "?", smooth_gap_ns < 16666666 ? "each refresh" : "60 a second",
 				((!getenv("VF_HIDDEN") && !getenv("VF_QUIT_AFTER")) || getenv("VF_GOVERN")) ? "on" : "off", vsync, hz, pw, ph);
 	};
@@ -1517,12 +1655,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "menu: couldn't load assets/ui (the game runs without it)\n");
 	menu.set_footer(std::string("Virtua Fighter Recomp ") + VF_VERSION + (*VF_DATE ? std::string(" \u00b7 ") + VF_DATE : ""));
 	// a new scale or shape reallocates the picture: draw it again at once when the game is stopped
-	auto redraw_if_stopped = [&] { if (paused || menu.is_open()) { m.set_stopped(true); m.redraw(); m.set_stopped(false); still_dirty = true; } };
+	auto redraw_if_stopped = [&] { settle(); if (paused || menu.is_open()) { R.set_stopped(true); R.redraw(); R.set_stopped(false); still_dirty = true; } };
 	// Reset (the menu, F3): the menu closes, a paused game unpauses, and the screen goes black at
 	// once while the boot runs unseen (a few seconds on a slow machine), not the last picture held.
 	// the arcade settings as their page opened (and the ring): see arcade_page
 	std::optional<std::array<int, 9>> assign_before;
 	auto reset_game = [&](bool keep_coins = true) {
+		settle();
 		assign_before.reset();   // a restart applies them
 		if (keep_coins) keep_arcade_coins();     // (Arcade: as the service menu may have left them)
 		menu.close();
@@ -1545,15 +1684,15 @@ int main(int argc, char **argv)
 		cfg.scale = v; cfg_dirty = true;
 		// the player's own choice starts the governor afresh (its 60-a-second limit included)
 		if (by_player) { smooth_gap_ns = 8333333; over_windows = 0; player_scale = player_aa = -1; gov_calm = 0; gov_raised = gov_no_raise = false; }
-		m.set_render_scale(v * aa_fit(v, cfg.aa));
-		m.set_edge_aa(cfg.aa == 0);
-		m.set_smooth(true);
+		settle();
+		each([&](model1 &x) { x.set_render_scale(v * aa_fit(v, cfg.aa)); x.set_edge_aa(cfg.aa == 0); x.set_smooth(true); });
 		sync.reset();                          // a new picture size: show the next frame as it is
 		auto_measure("a new scale or antialiasing");
 		make_texture(); present_shape(); redraw_if_stopped();
 		log_state(by_player ? "the player's scale or antialiasing" : "the governor's");
 	};
 	auto set_shape = [&](int v) {
+		settle();
 		aspect_i = cfg.aspect = v; cfg_dirty = true;
 		sync.reset();
 		apply_aspect(); make_texture(); present_shape(); redraw_if_stopped();
@@ -1600,7 +1739,7 @@ int main(int argc, char **argv)
 		p.items.push_back({ "Background filter",
 			"Smooth softens the stage backgrounds so they don't look blocky when enlarged. Off keeps their original pixels. Only matters above 1x.",
 			[&] { return std::string(cfg.smooth_bg ? "Smooth" : "Off"); },
-			[&](int) { cfg.smooth_bg = !cfg.smooth_bg; cfg_dirty = true; m.set_sky_filter(cfg.smooth_bg); redraw_if_stopped(); } });
+			[&](int) { cfg.smooth_bg = !cfg.smooth_bg; cfg_dirty = true; settle(); each([&](model1 &x) { x.set_sky_filter(cfg.smooth_bg); }); redraw_if_stopped(); } });
 		p.items.push_back({ "Screen filter",
 			"Scanlines adds the dark lines between the arcade monitor's rows. CRT adds those, the monitor's red, green and blue stripes, and slightly darker corners. The lines need a large window or fullscreen to show.",
 			[&] { return std::string(FILTER_NAMES[cfg.filter]); },
@@ -1608,9 +1747,34 @@ int main(int argc, char **argv)
 		p.items.push_back({ "Show FPS", "Shows the frame rate in the top right corner.",
 			[&] { return on_off(cfg.show_fps); },
 			[&](int) { cfg.show_fps = !cfg.show_fps; cfg_dirty = true; if (!cfg.show_fps) menu.set_fps(""); } });
+#ifdef __SWITCH__
+		p.items.push_back({ "Picture put together by",
+			"Which puts the picture together from the 3D and the backgrounds: the graphics chip (GPU) or the CPU. The same picture either way; one may be quicker on the Switch (try both with Show FPS on).",
+			[&] { return std::string(gpu_2d ? "GPU" : "CPU"); },
+			[&](int) {
+				if (gpu_2d) { gpu_2d = false; gc.reset(); show_target = false; cfg.cpu_2d = true; }
+				else {
+					std::string why;
+					if (gc.init(ren) && gc.self_check(why)) { gpu_2d = true; gpu_failed.clear(); cfg.cpu_2d = false; }
+					else fprintf(stderr, "the GPU can't put the pictures together (%s)\n", why.c_str());
+				}
+				cfg_dirty = true;
+				redraw_if_stopped();
+				log_state("the player's picture setting");
+			} });
+		p.items.push_back({ "Render thread",
+			"Draws each picture on a core of its own while the game runs its next frames on another, for a much higher frame rate. Turn it off if you see anything wrong in the picture. Takes effect from the next start.",
+			[&] { return on_off(cfg.render_thread) + (cfg.render_thread != bool(twin) ? " (next start)" : ""); },
+			[&](int) { cfg.render_thread = !cfg.render_thread; cfg_dirty = true; } });
+		p.items.push_back({ "CPU boost",
+			"Runs the Switch's CPU at 1785 MHz instead of 1020 while you play, so the game keeps up at higher render scales. The graphics chip, which only puts the picture together here, runs slower. Uses more battery; no effect while an overclock tool such as sys-clk sets the clocks.",
+			[&] { return on_off(cfg.cpu_boost); },
+			[&](int) { cfg.cpu_boost = !cfg.cpu_boost; cfg_dirty = true; switch_cpu_boost(cfg.cpu_boost); } });
+#else
 		p.items.push_back({ "Fullscreen", "Play fullscreen or in a window. (F11)",
 			[&] { return on_off(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN); },
 			[&](int) { set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); } });
+#endif
 		p.items.push_back(back_item());
 		return p;
 	};
@@ -1688,7 +1852,7 @@ int main(int argc, char **argv)
 				int i = int(std::find(std::begin(RINGS), std::end(RINGS), cfg.ring) - std::begin(RINGS));
 				cfg.ring = RINGS[std::clamp(i + d, 0, int(std::size(RINGS)) - 1)];
 				cfg_dirty = true;
-				m.set_ring_width(cfg.ring_now());
+				each([&](model1 &x) { x.set_ring_width(cfg.ring_now()); });
 			} });
 		choice("Rounds to win (vs CPU)", "Rounds needed to win a match against the computer.", ga::match_1p, [](int v) { return std::to_string(v); });
 		choice("Rounds to win (vs player)", "Rounds needed to win a match between two players.", ga::match_vs, [](int v) { return std::to_string(v); });
@@ -1728,7 +1892,7 @@ int main(int argc, char **argv)
 		static const char *RING[] = { "Normal", "Tiny", "Huge" };
 		p.items.push_back({ "Ring", "Tiny is half the smallest ring: ring outs everywhere. Huge is far wider than the stage: no ring outs.",
 			[&] { return std::string(RING[cfg.ring_cheat]); },
-			[&](int d) { cfg.ring_cheat = wrap(cfg.ring_cheat + d, 3); cfg_dirty = true; m.set_ring_width(cfg.ring_now()); } });
+			[&](int d) { cfg.ring_cheat = wrap(cfg.ring_cheat + d, 3); cfg_dirty = true; each([&](model1 &x) { x.set_ring_width(cfg.ring_now()); }); } });
 		p.items.push_back(back_item());
 		return p;
 	};
@@ -1881,7 +2045,7 @@ int main(int argc, char **argv)
 		p.items.push_back({ "Quit", "Saves and closes the game.", {}, {}, [&] { running = false; } });
 		return p;
 	};
-	auto open_menu = [&] { if (menu.ready() && !menu.is_open()) menu.open(main_page()); };
+	auto open_menu = [&] { settle(); if (menu.ready() && !menu.is_open()) menu.open(main_page()); };
 	// The game's clock: game frames due since it started, paced by the wall clock at the arcade's
 	// rate, trimmed by up to 1% to keep the sound queue at QUEUED frames. A frame runs when the
 	// clock passes it, and smooth motion's picture is for the clock's moment: its fraction is how
@@ -1908,11 +2072,19 @@ int main(int argc, char **argv)
 	// smooth motion) and its moment, the times to draw, put together on the GPU, upload and present,
 	// and the one-off work in it (tile maps decoded whole, layers drawn, stage skies built and scaled,
 	// backdrops padded, GPU textures made, pixels uploaded)
+#ifdef __SWITCH__
+	// (the Switch: trace = 1 in settings.ini, into trace.txt for the first 3600 passes, about a minute)
+	if (cfg.trace) setenv("VF_TRACE", (dir + "/trace.txt").c_str(), 1);
+#endif
 	static FILE *trace = getenv("VF_TRACE") ? fopen(getenv("VF_TRACE"), "w") : nullptr;
 	struct trace_pass { char kind = 'S'; int due = 0; double now = -1; uint64_t emu = 0, draw = 0, compose = 0, upload = 0, present = 0; } tp;
 	const uint64_t trace_t0 = SDL_GetTicksNS();
 	if (trace) fprintf(trace, "# pass t_ms due frame emu draw compose upload present kind now hold tiles_full tiles_ms layers layers_ms sky_build sky_build_ms sky_scale sky_scale_ms padded tex_made up_kpx stopped hp1 hp2 replay live r1 r2 quads mode alpha list0 list1 px py pz edge_ms\n");
+#ifdef __SWITCH__
+	uint64_t sw_draw = 0, sw_compose = 0, sw_upload = 0, sw_present = 0;   // (frame_timings: a pass's parts, to the log)
+#endif
 	while (running) {
+		if (twin && (paused || menu.is_open())) settle();
 		if (!gov_from) { gov_from = SDL_GetTicksNS() + 10000000000ull; log_state("the start"); }
 		bool in_texture = false;           // this pass's picture is on the GPU already (or the last one stays)
 		curtain = false;
@@ -2024,7 +2196,7 @@ int main(int argc, char **argv)
 			// settings changed in the menu are saved as it closes (not only at quit: a crash or a
 			// force quit would lose them); test runs save nothing
 			if (cfg_dirty && quit_after < 0) {
-				cfg.scale = m.render_scale() / aa_now();
+				cfg.scale = R.render_scale() / aa_now();
 				cfg.aspect = aspect_i;
 				save_settings();
 				cfg_dirty = false;
@@ -2075,12 +2247,34 @@ int main(int argc, char **argv)
 					if (told++ == 0) fprintf(stderr, "sound: %d ms queued (the device is slow or stalled): the game waits for it\n", int(q * 1000.0 / (frame_bytes * FRAME_HZ)));
 					sound_full = true;
 				}
+#if defined(__SWITCH__) || defined(VF_AUDIO_REOPEN)
+				// The Switch's sound device can stop taking data for good (after a very long frame at
+				// the start): the game then waited for it forever, a black screen. Taking nothing for
+				// half a second: it's opened again, the queued sound dropped.
+				{
+					static int last_q = -1;
+					static uint64_t stuck_since = 0;
+					const uint64_t now = SDL_GetTicksNS();
+					if (!sound_full || q < last_q) stuck_since = 0;
+					else if (!stuck_since) stuck_since = now;
+					else if (now - stuck_since > 500000000ull) {
+						fprintf(stderr, "sound: the device took nothing for half a second: opened again\n");
+						SDL_DestroyAudioStream(audio);
+						audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+						if (audio) { SDL_SetAudioStreamGain(audio, cfg.volume / 100.0f); SDL_ResumeAudioStreamDevice(audio); }
+						else fprintf(stderr, "sound: couldn't open it again (%s): the game keeps time by the clock\n", SDL_GetError());
+						stuck_since = 0;
+						sound_full = false;
+					}
+					last_q = q;
+				}
+#endif
 				queue_avg += (q - queue_avg) * std::min(1.0, dt / 0.5);
 				rate *= 1 - std::clamp((queue_avg / frame_bytes - QUEUED) * 0.005, -0.01, 0.01);
 				if (q < frame_bytes * 3 / 2) low = int(std::ceil(QUEUED - double(q) / frame_bytes));
 			}
 			frame_clock += dt * rate;
-			m.set_parts_mode(gpu_2d && aa_now() == 1 && !gpu_failed.count(m.render_scale()));
+			m.set_parts_mode(gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale()));
 			int due = int(int64_t(std::floor(frame_clock)) - game_run);
 			// A pass that came late (a scene change's work, the machine busy elsewhere) doesn't run
 			// the time it lost as frames back to back: that made the game, and smooth motion's
@@ -2121,11 +2315,12 @@ int main(int argc, char **argv)
 				// (in parts when the GPU puts the pictures together: only the 3D drawn at the render scale)
 				bool probe_parts = false;
 				if (m.smooth() && sync.holding()) {
-					if (gpu_2d && aa_now() == 1 && !gpu_failed.count(m.render_scale())) {
+					if (twin) { settle(); twin->copy_render_inputs(m); }
+					if (gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale())) {
 						g3_prepare();
-						probe_parts = m.render_parts(double(m.frame_number()), parts, false) == 1;
+						probe_parts = R.render_parts(double(m.frame_number()), parts, false) == 1;
 					}
-					else m.render_smooth(double(m.frame_number()), false);
+					else R.render_smooth(double(m.frame_number()), false);
 				}
 				const bool was_holding = sync.holding();
 				const bool show_it = sync.show(m);
@@ -2134,7 +2329,7 @@ int main(int argc, char **argv)
 				if (show_it) {
 					curtain = sync.holding();
 					curtain_on_gpu = probe_parts && sync.holding() &&
-									 gc.draw(parts, m.frame_w(), m.frame_h(), m.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+									 gc.draw(parts, R.frame_w(), R.frame_h(), R.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
 				}
 				show_frame = show_it || show_frame;
 				// a new scene: nothing to blend from, unless both lists kept are its own (it was built
@@ -2172,9 +2367,9 @@ int main(int argc, char **argv)
 			// The limit is a budget, not a minimum gap: a gap of 8 ms skipped about a third of a 120 Hz
 			// screen's refreshes (8.3 ms apart, give or take), so it showed 70-odd pictures, not 120.
 			// a stage's sky scaled on its threads and done, not yet in use: a band of it to the GPU
-			if (gpu_2d && aa_now() == 1 && !gpu_failed.count(m.render_scale())) {
+			if (gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale()) && !(twin && job_pending)) {
 				model1::gpu_image pending;
-				if (m.sky_pending(pending)) {
+				if (R.sky_pending(pending)) {
 					const uint64_t tq = SDL_GetTicksNS();
 					gc.preload(pending);
 					tp.upload += SDL_GetTicksNS() - tq;
@@ -2186,21 +2381,86 @@ int main(int argc, char **argv)
 			  smooth_budget = std::min(2.0, smooth_budget + double(bt - budget_t) / double(smooth_gap_ns));
 			  budget_t = bt; }
 			const bool unseen = SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED);
-			if (m.smooth() && !sync.holding() && !unseen && (due || smooth_budget >= 1)) {
+			if (twin && m.smooth() && !sync.holding() && !unseen && (due || smooth_budget >= 1)) {
+				// Pipelined: the picture the twin drew during this pass's frames goes on screen; then the
+				// twin takes the game's state as it is now and draws the next while the next frames run
+				smooth_budget = std::max(0.0, smooth_budget - 1);
+				const double now = double(m.frame_number() - 1) + std::clamp(frame_clock - double(game_run), 0.0, 1.0);
+				const double t = std::min(now, double(m.frame_number()));
+				const bool in_parts = gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale());
+				const uint64_t tw = SDL_GetTicksNS();
+				if (job_pending) {
+					drawer.wait();
+					job_pending = false;
+					tp.draw = job_ns;
+					tp.kind = 'N';
+					const uint64_t tc = SDL_GetTicksNS();
+					if (job_r == 0) { tp.kind = 'C'; in_texture = cut_hold = true; }
+					else if (job_r == 1 && in_parts) {
+						if (gc.draw(parts, R.frame_w(), R.frame_h(), R.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST)) {
+							show_target = in_texture = true;
+							++gpu_pictures;
+						} else {                      // the GPU failed: drawn whole, and at this scale from now on
+							fprintf(stderr, "pictures drawn on the CPU at %dx: the GPU couldn't put them together (%s)\n", R.render_scale(), SDL_GetError());
+							gpu_failed.insert(R.render_scale());
+							gc.reset();
+							R.redraw();
+							upload();
+							in_texture = true;
+						}
+						tp.compose = SDL_GetTicksNS() - tc;
+					} else { tp.kind = 'W'; upload(); in_texture = true; tp.upload = SDL_GetTicksNS() - tc; }
+					if (in_parts) {           // a stage's sky scaled meanwhile: a band of it to the GPU
+						model1::gpu_image pending;
+						if (R.sky_pending(pending)) gc.preload(pending);
+					}
+					show_frame = true;
+					auto_tick();
+				}
+				twin->copy_render_inputs(m);
+				{   // now and then: the twin's picture checked against the one the game's own model1
+					// draws of the same moment (the same but for a camera cut's or the sky's own history)
+					static int pictures = 0;
+					if (++pictures == 120 || pictures % 1800 == 0) {
+						R.render_smooth(t, false);
+						const std::vector<uint32_t> a(R.frame().data(), R.frame().data() + size_t(R.frame_w()) * R.frame_h());
+						m.render_smooth(t, false);
+						long long n = 0;
+						int y0 = -1, y1 = -1;
+						if (m.frame_w() == R.frame_w() && m.frame_h() == R.frame_h())
+							for (int y = 0; y < R.frame_h(); y++)
+								for (int x = 0; x < R.frame_w(); x++)
+									if ((a[size_t(y) * R.frame_w() + x] ^ m.frame().data()[size_t(y) * R.frame_w() + x]) & 0xffffff) { n++; if (y0 < 0) y0 = y; y1 = y; }
+						fprintf(stderr, "render thread check, picture %d (frame %llu): %lld of %d x %d pixels differ%s; the 2D layers kept: %lld pixels differ\n", pictures,
+								(unsigned long long)m.frame_number(), n, R.frame_w(), R.frame_h(),
+								n ? (" (rows " + std::to_string(y0) + " to " + std::to_string(y1) + ")").c_str() : "", R.check_kept_layers());
+					}
+				}
+				tp.now = t;
+				drawer.start([&, t, in_parts] {
+					const uint64_t t0 = SDL_GetTicksNS();
+					job_r = in_parts ? R.render_parts(t, parts) : R.render_smooth(t) ? 2 : 0;
+					job_ns = SDL_GetTicksNS() - t0;
+				});
+				job_pending = true;
+				in_texture = true;            // (the picture on show stays until the next is in)
+				perf.present += SDL_GetTicksNS() - tw;
+				perf.work += SDL_GetTicksNS() - tw;
+			} else if (m.smooth() && !sync.holding() && !unseen && (due || smooth_budget >= 1)) {
 				smooth_budget = std::max(0.0, smooth_budget - 1);
 				const double now = double(m.frame_number() - 1) + std::clamp(frame_clock - double(game_run), 0.0, 1.0);
 				const uint64_t tr = SDL_GetTicksNS();
 				const double t = std::min(now, double(m.frame_number()));
 				tp.now = t;
 				tp.kind = 'N';
-				if (gpu_2d && aa_now() == 1 && !gpu_failed.count(m.render_scale())) {
+				if (gpu_2d && aa_now() == 1 && !gpu_failed.count(R.render_scale())) {
 					g3_prepare();
-					const int r = m.render_parts(t, parts);
+					const int r = R.render_parts(t, parts);
 					const uint64_t tc = SDL_GetTicksNS();
 					tp.draw = tc - tr;
 					if (r == 0) tp.kind = 'C';
 					else if (r == 2) tp.kind = 'W';
-					const bool composed = r == 1 && gc.draw(parts, m.frame_w(), m.frame_h(), m.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+					const bool composed = r == 1 && gc.draw(parts, R.frame_w(), R.frame_h(), R.render_scale() > 1 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
 					if (r == 1) tp.compose = SDL_GetTicksNS() - tc;
 					if (composed) {
 						show_target = in_texture = true;
@@ -2208,16 +2468,16 @@ int main(int argc, char **argv)
 						if (gpu_verified < 3 && gpu_pictures == (gpu_verified == 0 ? 1 : gpu_verified == 1 ? 60 : 600)) {
 							gpu_verified++;
 							std::vector<uint32_t> back;
-							const size_t px = size_t(m.frame_w()) * m.frame_h();
+							const size_t px = size_t(R.frame_w()) * R.frame_h();
 							const bool read = gc.read(back) && back.size() == px;
-							m.redraw();
-							const picture_diff d = read ? compare(back, m.frame().data(), px, parts.d3_target >= 0) : picture_diff{};
+							R.redraw();
+							const picture_diff d = read ? compare(back, R.frame().data(), px, parts.d3_target >= 0) : picture_diff{};
 							if (read && d.n && !d.wrong)
 								fprintf(stderr, "the GPU's picture %d: %lld of %d x %d pixels differ by rounding (%lld by more than 8, colours by %d at most): kept on the GPU\n",
-										gpu_pictures, d.n, m.frame_w(), m.frame_h(), d.big, d.most);
+										gpu_pictures, d.n, R.frame_w(), R.frame_h(), d.big, d.most);
 							if (!read || d.wrong) {   // the CPU's picture, from now on
 								if (read) fprintf(stderr, "pictures drawn on the CPU from now on: the GPU's picture %d differs from the CPU's (%lld of %d x %d pixels, %lld by more than 8, colours by %d at most)\n",
-												  gpu_pictures, d.n, m.frame_w(), m.frame_h(), d.big, d.most);
+												  gpu_pictures, d.n, R.frame_w(), R.frame_h(), d.big, d.most);
 								else fprintf(stderr, "pictures drawn on the CPU from now on: the GPU's picture %d couldn't be read back\n", gpu_pictures);
 								gpu_2d = false;
 								gc.reset();
@@ -2227,29 +2487,29 @@ int main(int argc, char **argv)
 						if (gpu_2d && gpu_check && gpu_pictures % gpu_check == 0) {   // the CPU's picture of the same moment
 							std::vector<uint32_t> back;
 							if (gc.read(back)) {
-								m.redraw();
-								const long long n = back.size() == size_t(m.frame_w()) * m.frame_h() ? compare(back, m.frame().data(), back.size(), parts.d3_target >= 0).n : -1;
+								R.redraw();
+								const long long n = back.size() == size_t(R.frame_w()) * R.frame_h() ? compare(back, R.frame().data(), back.size(), parts.d3_target >= 0).n : -1;
 								gpu_checked++;
 								if (n) fprintf(stderr, "gpu check: picture %d: %lld pixels differ (frame %llu, moment %.4f)\n", gpu_pictures, n, (unsigned long long)m.frame_number(), t);
 								if (n && getenv("VF_GPU_CHECK_DUMP")) {   // testing: both pictures
 									char path[512];
 									snprintf(path, sizeof path, "%s/gpu_%d.png", getenv("VF_GPU_CHECK_DUMP"), gpu_pictures);
-									write_png(path, back.data(), m.frame_w(), m.frame_h());
+									write_png(path, back.data(), R.frame_w(), R.frame_h());
 									snprintf(path, sizeof path, "%s/cpu_%d.png", getenv("VF_GPU_CHECK_DUMP"), gpu_pictures);
-									write_png(path, m.frame().data(), m.frame_w(), m.frame_h());
+									write_png(path, R.frame().data(), R.frame_w(), R.frame_h());
 								}
 								gpu_differ += n != 0;
 							}
 						}
 					} else if (r == 0) in_texture = cut_hold = true;   // (a cut's hold: the picture on show stays)
 					else if (r == 1) {                        // the GPU failed: drawn whole, and at this scale from now on
-						fprintf(stderr, "pictures drawn on the CPU at %dx: the GPU couldn't put them together (%s)\n", m.render_scale(), SDL_GetError());
-						gpu_failed.insert(m.render_scale());
+						fprintf(stderr, "pictures drawn on the CPU at %dx: the GPU couldn't put them together (%s)\n", R.render_scale(), SDL_GetError());
+						gpu_failed.insert(R.render_scale());
 						gc.reset();
-						m.redraw();
+						R.redraw();
 					}
 				} else {
-					if (!m.render_smooth(t)) { tp.kind = 'C'; cut_hold = true; }
+					if (!R.render_smooth(t)) { tp.kind = 'C'; cut_hold = true; }
 					tp.draw = SDL_GetTicksNS() - tr;
 				}
 				perf.present += SDL_GetTicksNS() - tr;
@@ -2299,7 +2559,8 @@ int main(int argc, char **argv)
 			if (stopped != was_stopped) still_dirty = true;
 			// stopped in a held scene change: the picture to keep is the one on screen, not the
 			// scene being built that was drawn to look at
-			if (stopped && !was_stopped && m.frame_unshown()) m.redraw();
+			if (stopped && !was_stopped) settle();
+			if (stopped && !was_stopped && R.frame_unshown()) R.redraw();
 			was_stopped = stopped;
 			show_frame = stopped && still_dirty;
 			if (show_frame) still_dirty = false;
@@ -2330,12 +2591,15 @@ int main(int argc, char **argv)
 		// the governor counts as missed
 		if (!paused && !menu.is_open() && (sync.holding() || cut_hold)) perf.held++;
 		SDL_RenderPresent(ren);
+#ifdef __SWITCH__
+		sw_draw += tp.draw; sw_compose += tp.compose; sw_upload += tp.upload; sw_present += SDL_GetTicksNS() - t1;
+#endif
 		if (trace) {
 			const bool stopped = paused || menu.is_open();
 			if (stopped) tp.kind = 'X';
 			else if (sync.holding() && tp.kind == 'S') tp.kind = 'H';
 			tp.present = SDL_GetTicksNS() - t1;
-			model1::work_trace &w = m.m_work;
+			model1::work_trace &w = R.m_work;
 			auto nv16 = [&](uint32_t a) { return unsigned(m.nvram()[a] | m.nvram()[a + 1] << 8); };
 			float sa, place[3]; int s0, s1;
 			m.smooth_state(sa, s0, s1, place);
@@ -2347,6 +2611,10 @@ int main(int argc, char **argv)
 					unsigned(m.work_ram()[0x1281]), unsigned(m.work_ram()[0x1282]), int(m.frame_quads()), unsigned(m.game_mode()), sa, s0, s1, place[0], place[1], place[2], w.edge_ns / 1e6);
 			w = model1::work_trace{};
 			gc.made = 0; gc.uploaded = 0;
+#ifdef __SWITCH__
+			static int traced = 0;
+			if (++traced >= 3600) { fclose(trace); trace = nullptr; fprintf(stderr, "trace.txt written\n"); }
+#endif
 		}
 		// Without vsync (forced off, or a minimised window) present returns at once: don't spin a core.
 		{ static uint64_t pass = SDL_GetTicksNS(); const uint64_t t = SDL_GetTicksNS();
@@ -2392,6 +2660,19 @@ int main(int argc, char **argv)
 						 perf.present / 120e6, perf.starved);
 				SDL_SetWindowTitle(win, t);
 				fprintf(stderr, "%s\n", t);
+#ifdef __SWITCH__
+				fprintf(stderr, "  a pass: drawing %.1f ms, put together %.1f ms, upload %.1f ms, to the screen %.1f ms (the 2D on the %s)\n",
+						sw_draw / 120e6, sw_compose / 120e6, sw_upload / 120e6, sw_present / 120e6, gpu_2d ? "GPU" : "CPU");
+				{   // the drawing's parts (the model's own counters, since the last)
+					static model1::work_trace last;
+					const model1::work_trace &w = R.m_work;
+					if (w.d3_ns < last.d3_ns || w.tiles_ns < last.tiles_ns) last = {};   // (trace.txt resets them)
+					fprintf(stderr, "  drawing: the 3D %.1f ms (rasterizer %.1f), the 2D layers %.1f ms, tiles %.1f ms, layers prepared %.1f ms; %d polygons\n",
+							(w.d3_ns - last.d3_ns) / 120e6, (w.raster_ns - last.raster_ns) / 120e6, (w.draw2d_ns - last.draw2d_ns) / 120e6,
+							(w.tiles_ns - last.tiles_ns) / 120e6, (w.layers_ns - last.layers_ns) / 120e6, int(m.frame_quads()));
+					last = w;
+				}
+#endif
 			}
 			if (((!hidden && quit_after < 0) || getenv("VF_GOVERN")) && !paused && !menu.is_open()) {
 				const double secs = double(SDL_GetTicksNS() - perf.since) / 1e9;
@@ -2457,29 +2738,38 @@ int main(int argc, char **argv)
 				}
 			}
 			perf = perf_stats{ perf.show };
+#ifdef __SWITCH__
+			sw_draw = sw_compose = sw_upload = sw_present = 0;
+#endif
 			perf.since = SDL_GetTicksNS();
 		}
 
 	}
 
 	if (g3) fprintf(stderr, "the 3D at the end: %llu pictures drawn by the GPU, %llu checked against the CPU's, %llu differ; %llu drawn by the CPU instead, %llu GPU errors\n",
-					(unsigned long long)m.m_g3.pictures, (unsigned long long)m.m_g3.checked, (unsigned long long)m.m_g3.differ,
-					(unsigned long long)m.m_g3.cpu_fallback, (unsigned long long)m.m_g3.failed);
-	if (m.m_g3.handed) fprintf(stderr, "the 3D at the end: %llu of the GPU's pictures straight into the renderer's texture\n", (unsigned long long)m.m_g3.handed);
+					(unsigned long long)R.m_g3.pictures, (unsigned long long)R.m_g3.checked, (unsigned long long)R.m_g3.differ,
+					(unsigned long long)R.m_g3.cpu_fallback, (unsigned long long)R.m_g3.failed);
+	if (R.m_g3.handed) fprintf(stderr, "the 3D at the end: %llu of the GPU's pictures straight into the renderer's texture\n", (unsigned long long)R.m_g3.handed);
 	g3_unwrap();                         // (the renderer's wraps of its textures go first)
+	settle();
+	drawer.stop();
 	m.set_gpu3d(nullptr);
 	g3.reset();                          // (its device goes before SDL does)
 	if (gpu_check) fprintf(stderr, "gpu check: %d pictures put together on the GPU checked, %d differ\n", gpu_checked, gpu_differ);
 	gc.reset();                          // (its textures go before the renderer)
-	if (quit_after >= 0 && !getenv("VF_SAVE")) { SDL_Quit(); return 0; }   // test runs leave the saves and settings alone (VF_SAVE: they save, as a player's)
+	if (quit_after >= 0 && !getenv("VF_SAVE")) { menu.shutdown(); SDL_Quit(); return 0; }   // test runs leave the saves and settings alone (VF_SAVE: they save, as a player's)
 	keep_arcade_coins();
 	save_blob(nv_path, m.nvram().data(), m.nvram().size());
 	save_blob(ee_path, m.eeprom(), model1::EEPROM_SIZE);
 	if (cfg_dirty) {
-		cfg.scale = m.render_scale() / aa_now();
+		cfg.scale = R.render_scale() / aa_now();
 		cfg.aspect = aspect_i;
 		save_settings();
 	}
+#ifdef __SWITCH__
+	switch_cpu_boost(false);   // (the clocks back as they were)
+#endif
+	menu.shutdown();
 	SDL_Quit();
 	return 0;
 }

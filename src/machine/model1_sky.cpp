@@ -9,6 +9,7 @@
 // edge; the rows come from where the tile chip drew each line from. The replacement is then
 // drawn across the whole width, so widescreen shows the real panorama to the sides.
 #include "model1.h"
+#include "parallel.h"
 #include <future>
 #include <memory>
 #include <thread>
@@ -394,12 +395,13 @@ bool model1::sky_ready(const sky_art &a)
 		const bool smooth = m_sky_smooth;
 		std::vector<uint32_t> *out = &m_sky_job_px;
 		m_sky_job = std::async(std::launch::async, [art, s, smooth, out] {
+			vf_thread_to_core(vf_worker_core(1));   // (the Switch: off the game's core)
 			const uint64_t t0 = trace_ns();
 			// its own threads: the drawing threads' pool takes one caller at a time
 			scale_sky_px(*art, s, smooth, *out, [](int n, const std::function<void(int, int)> &f) {
 				const int t = std::clamp(int(std::thread::hardware_concurrency()) / 2, 1, 4);
 				std::vector<std::thread> th;
-				for (int i = 1; i < t; i++) th.emplace_back([&, i] { f(n * i / t, n * (i + 1) / t); });
+				for (int i = 1; i < t; i++) th.emplace_back([&, i] { vf_thread_to_core(vf_worker_core(i + 1)); f(n * i / t, n * (i + 1) / t); });
 				f(0, n / t);
 				for (auto &x : th) x.join();
 			});
